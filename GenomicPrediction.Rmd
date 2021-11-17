@@ -1,0 +1,335 @@
+---
+title: "Genomic Prediction"
+author: "Jim Holland"
+date: "11/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("Q:/My Drive/Teaching/Teaching_videos")
+library(tidyverse)
+library(lme4)
+library(emmeans)
+library(rrBLUP)
+library(BGLR)
+library(sommer)
+```
+Load the numericalized marker matrix and genomic relationship matrix we made in Population Structure example:
+```{r}
+load("Tuson.Rdata")
+```
+
+##Prepare phenotype data
+  
+Get the raw phenotypic data, skip the first 51 rows of the file, which have metadata
+```{r}
+pheno = read.csv("doi_10.5061_dryad.8f64f__v1/teixeira_etal_rawdata.csv", skip = 51, header = T)
+head(pheno)
+```
+Notice that this file does not have genotype IDs that match the marker matrix. Instead it has gen_slope and entry names that if pasted together could match the marker data IDs.
+```{r}
+head(pheno[c("gen_slope", "entry")])
+```
+Here is an example of some of the sample IDs in geno.num:
+```{r}
+tail(rownames(K))
+```
+
+Let's make a new column sampleID to match the rownames of geno.num
+```{r}
+pheno = pheno %>% mutate(sampleID = paste0("C", gen_slope, "_", entry))
+```
+
+Most of these should have a match in the rownames of geno.num
+```{r}
+head(pheno$sampleID %in% rownames(geno.num))
+```
+
+Some of the entries in the field experiment are check hybrids, so they will not be included in row.names of geno.num:
+```{r}
+unique(pheno$sampleID)[! unique(pheno$sampleID) %in% row.names(geno.num)]
+```
+These are check lines and a few families from the experiment that failed genotyping, so this look OK.  
+  
+Now we need to summarize the field data for trait 'dts' (days to silking) to get a mean value for each entry across environments and field blocks to use in our genomic prediction models. We want adjusted means, or best linear unbiased estimators (BLUEs) to account for the differences in field effects due to blocks and environments in the face of missing data resulting in unbalanced data.    
+
+Let's fit the linear model:  
+dts = mu + site + rep(site) + block(rep:site) + entry + entry:env + residual  
+  
+We will fit rep and block as random effects and all else as fixed effects
+```{r}
+dts.mod = lmer("dts ~ 1 + site + (1|rep:site) + (1|block:rep:site) + sampleID + (1|sampleID:site)", pheno)
+```
+
+Get the BLUEs using emmeans
+```{r}
+dts.blues = summary(emmeans(dts.mod, "sampleID"))
+```
+
+Summarize the means by Cycle population
+```{r}
+dts.blues = dts.blues %>% 
+  mutate(Cycle = str_extract(sampleID, "^C[0-9]+"),
+         Cycle = ifelse(is.na(Cycle), "Check", Cycle)) %>%
+  rename(dts = emmean)
+
+dts.blues %>% group_by(Cycle) %>% summarize(Mean_DTS = mean(dts))
+```
+Unfortunately, they are out of order, but you can see that the days to silking reduced by several days between each two generations of selection.
+
+## Heritability of phenotype
+
+One other quick thing to check - what is the heritability of the mean values? We want to know this becacuse it helps to understand how high the genomic prediction accuracy can be. We can get at that by fitting a separate model where sampleID is a random effect and then constructing a ratio of genetic variance to other variances.
+```{r}
+dts.mod.rand = lmer("dts ~ 1 + site + (1|rep:site) + (1|block:rep:site) + (1|sampleID) + (1|sampleID:site)", pheno)
+varcomps = as.data.frame(VarCorr(dts.mod.rand))
+Vg = varcomps[varcomps$grp == "sampleID", "vcov"]
+Vge = varcomps[varcomps$grp == "sampleID:site", "vcov"]
+Verr = varcomps[varcomps$grp == "Residual", "vcov"]
+```
+
+The heritability of mean values involves the residual variance divided by the number of plots per entry and the GxE variance divided by the number of sites each entry was tested at. The data are not perfectly balanced, but it's pretty close, so we can just get the average values of these to use in the heritability calculation:
+```{r}
+pheno2 = pheno %>% filter(is.na(check))  #drop the checks
+pheno2 %>% group_by(sampleID) %>%
+  summarize(N = n()) %>% summary()
+```
+We'll use a value of 17 in our calculation (should really use the harmonic mean, but this is for quick demonstration purposes).
+
+```{r}
+pheno2 %>% group_by(site, sampleID) %>%
+  summarize(r = n()) %>% 
+  group_by(sampleID) %>%
+  summarize(e = n()) %>%
+  summary()
+```
+All of the entries were evaluated in exactly 9 environments.
+  
+So, we want to estimate H = Vg/(Vg + Vge/9 + Verr/17) 
+```{r}
+Vg/(Vg + (Vge/9) + (Verr/17)) 
+```
+The mean heritability is VERY high! So we should be able to get accurate genomic predictions for this trait. 
+
+##GBLUP model
+
+We can fit a linear mixed model to the trait data like this:
+
+$$Y_i = \mu + G_{i} + \epsilon_{i}$$
+Now Y is the vector of the BLUEs and we model the genotype (sampleID) effects as random. This model looks weird because how can we fit both a genotype effect AND a residual effect for that genotype with no information on replicated observations in the BLUEs? If you fit this model assuming the default IID variance structure among the G effects (each genotype is an independent effect), it will not work because there is no way to separate G from $\epsilon$. 
+
+The trick about the GBLUP model is that we can make this model work even without replicated data because we can move away from the assumption that all of the $G_{i}$ are independent to a new model where the $G_{i}$ have covariances proportional to their realized additive genomic relationships:
+
+$$G_{i} \sim N(0, \mathbf{K}\sigma^{2}_{A})$$
+Recall that the K matrix elements indicate the additive genetic relationships between pairs of individuals. Those additive relationships times the additive variance equal the additive genetic covariance for each pair. So, we can fit a mixed model that includes the constraint that the matrix of genotypic effect covariances is proportional to the K matrix, and now the residual effects for each genotype reflect the difference between the observed BLUE and the effect estimated under this model (in other words, the deviation of the phenotype mean from the additive genetic value, which could include experimental error effects, non-additive genetic effects, true additive effects that are not modelled well by the K matrix, and so forth).
+
+The GBLUP model gets its name from Genomic Best Linear Unbiased Predictors, which are analogous to fixed effect BLUEs but are the random effect predictions. Notice that this model can be computationally efficient because we have already summarized thousands of marker genotype scores into a matrix that has dimensions equal to the number of individuals (much much less than the number of markers). 
+
+Does this model make sense? It does make sense if the trait is controlled by many genes, each with equal (and therefore, small) effects. In this way, each marker provides equal information on the overall genomic relationships being modelled. If you have lots of markers distributed randomly throughout the genome, you will capture the true underlying relationships reasonably well. In practice, this model in fact performs robustly for most quantitative traits. You can 'train' the model on one set of individuals with observed phenotypes, then predict the values of other genotypes that are included in the relationship matrix even although they do not have phenotypic observations. The model will predict these 'new' individuals as having phenotypes similar to the individuals in the training set that they are most related to.
+
+Let's fit a basic GBLUP model with the mixed models sommer package. Use the BLUEs as 'y' values (dropping the checks and any other entries not included in the K matrix). Let's also mask the trait data for a random 20% of the lines, get their genomic predictions, and compare those to observed means.
+```{r}
+set.seed(1)
+dts.blues2 = dts.blues %>% filter(sampleID %in% row.names(K)) %>%
+  mutate(sampleID = as.character(sampleID))
+
+train = sample(dts.blues2$sampleID, round(0.8*nrow(dts.blues2)))
+test = dts.blues2$sampleID[!dts.blues2$sampleID %in% train]
+dts.blues2 = dts.blues2 %>%
+  mutate(dts.train = ifelse(sampleID %in% train, dts, NA))
+
+sommer.mod <- mmer(dts.train ~ 1, 
+                   random = ~vs(sampleID, Gu=K),
+                   data = dts.blues2)
+
+#get the GBLUPs and subset to only the test set
+gblups = sommer.mod$U$`u:sampleID`[[1]] #these are deviations from the overall mean (so centered on zero)
+gblups.test = data.frame(sampleID = names(gblups[test]), dts.gblup = gblups[test])
+observed.test = right_join(dts.blues2, gblups.test, by = "sampleID")
+
+```
+Before we evaluate the test set predictions, first we can look at the model fit within the training set itself. Here are the genetic and residual variance components:
+```{r}
+sommer.mod$sigma
+```
+You can see that the model fits the training set observations 'perfectly'. There is no error variance. This is not typical, but due to the high heritability and good marker coverage of this example. The main point is that even when we have a perfect fit within the training set, we should not expect that the model will predict the held-out test individuals as well.   
+Here is the correlation of observed and predicted values within the test set:
+```{r}
+cor(observed.test[c("dts", "dts.gblup")])
+```
+It's pretty good!  
+  
+Plot the observed values against their predictions:
+```{r}
+plot(observed.test[c("dts.gblup", "dts")])
+```
+If you want to get 'marginal predictions' in terms of actual days to flowering, we can add on the intercept from the model fit, as the gblups are deviations from that value.
+```{r}
+mu = sommer.mod$Beta$Estimate
+observed.test$dts.gblup = observed.test$dts.gblup + mu
+plot(observed.test[c("dts.gblup", "dts")])
+```
+There is a small difference between the predicted mean and the observed mean in the training set
+```{r}
+print("Mean observed:")
+print(mean(observed.test$dts))
+print("Mean predicted:")
+print(mean(observed.test$dts.gblup))
+```
+and also in the dispersion of the predicted vs observed values:
+```{r}
+lm(dts ~ dts.gblup, data = observed.test)
+```
+The slope of the regression is > 1, indicating that the observed values have a bit more variation than the predicted values due to shrinkage in the predictions. For the purposes of selection, the prediction ability (the correlation between predicted and observed values) is what matters, but for other purposes like actually predicting the absolute value of performance, the bias in the intercept and slope of the predictions can have a big impact.
+
+## RRBlup Model
+We can also fit a model that includes an effect for each individual marker:  
+
+$$Y_i = \mu + \sum_{k=1}^n m_{ik}\beta_k + \epsilon_{i}$$
+where, now we are estimating the effects of each marker k (as $\beta_k$) and then for each individual, we sum over all markers the product of its numerical marker score (like 0, 1, or 2) times the marker effect.
+  
+Like the GBLUP model, at first glance this model seems badly overfitted. How can we model the effects of thousands of markers when we only have a few hundred observations? With ordinary least squares, we cannot.  
+  
+The solution is to use ridge regression, which imposes 'regularization' on the marker effects so that when they are combined: their combined variation is forced to be no larger than the observed genotype variation. What happens is that their effect estimates ($\beta_k$) get 'squished' strongly toward zero. We are not trying to get good estimates of individual marker effects, instead, we are trying to get good estimates of the sum of their combined effects, and the ridge regression model allows this to happen.
+  
+We won't go into any detail here, but the ridge regression model is widely used in machine learning and predictive modelling, so it's good to read up on and learn more about. Here we will just demonstrate its use in the rrBLUP package in R. The idea behind the genomic predictions using this model is that we train the model on a set of individuals with both marker data and phenotypes to estimate the $\beta_k$ effects for each marker. Then we can predict the values in a new set of individuals based on their known marker scores times these previously estimate $\beta_k$ effects. That will give us the 'ridge regresion BLUPs'.  
+```{r}
+geno.num2 = geno.num[dts.blues2$sampleID,]
+rr.mod = mixed.solve(dts.blues2$dts.train, Z = geno.num2)
+```
+Here is the estimated variance for each marker:
+```{r}
+rr.mod$Vu
+```
+Since the model fits all markers with equal variance, we can relate this to the overall genetic variance as the product of the variance of marker scores ($m^2_{ik}$) times  the variance of marker effects ($\beta^2_{k}$) summed over markers:
+```{r}
+#average marker variance
+marker.var = apply(geno.num2, 2, var)
+sum(marker.var)*rr.mod$Vu
+```
+
+Compare this to the training set genetic variance from the GBLUP model:
+```{r}
+sommer.mod$sigma$`u:sampleID`
+```
+
+They are very very close.  
+  
+Here is the residual variance in training set from rrBLUP:
+```{r}
+rr.mod$Ve
+```
+Effectively, this is zero, as we saw for the GBLUP model as well.  
+  
+Compare the observed to rrBLUP predicted values in test set
+```{r}
+betas = rr.mod$u
+rr.preds = geno.num[test,]%*%betas
+rr.preds = data.frame(sampleID = rownames(rr.preds), dts.rrBLUP = rr.preds)
+observed.test = merge(observed.test, rr.preds, by = "sampleID")
+cor(observed.test[c("dts", "dts.rrBLUP")])
+```
+Compare the GBLUPS to the rrBLUPs:
+```{r}
+cor(observed.test[c("dts.gblup", "dts.rrBLUP")])
+```
+The GBLUPs and the rrBLUPs in the test set are perfectly correlated. The two models are doing the same thing in different ways. GBLUP estimates individual effects based on their marker relationships, whereas rrBLUP estimates marker effects constrained to have variance equal to the observed genotypic variance.  
+    
+(by the way you can also fit a simple GBLUP model in rrBLUP as well...but I showed the sommer package because it has more flexibility for more complex mixed models so is worth knowing about)
+
+##Bayesian Prediction Models
+The GBLUP and rrBLUP models both assume that all markers have equally small effects. This assumption makes these models relatively easy to compute, and in practice they tend to be generally good models so are widely used.  
+  
+However, you may have a trait/population where you have good reason to think that the genetic control of the trait may be influenced by a mixture of some large-effect genes in addition to small-effect polygenes. The more a trait is influenced by large-effect variants, the farther away we move from the assumption that all genes have equal effects, and we want some way to include differences in QTL effects in our models.  
+  
+The situation is pretty hopeless from a regular least squares or mixed models framework, we just don't have enough information to reliably estimate a large number of marker effects simultaneously. This is a situation where Bayesian analysis becomes very useful. A Bayesian model posits a prior distribution of marker effects (which could include equal effects, but can also include a mixture of large and small effects). Given this prior distribution, one can take a random sample of effects from the distribution, and once that specific sample of effects is 'known', then the observed data can be fit to that model and all of the marker effects estimated. It's analogous to how the ridge regression model allows us to estimate all of the marker effects by constraining how much total variation they can explain. Here, we constrain the marker effects by how much total variation they can explain and by forcing their effects to match the sampled distribution.  
+  
+Then, if we repeat this sampling from the prior distribution many thousands of times, we can summarize over the many iterations of the analysis to get a posterior distribution of effect estimates. Markers that regularly get fitted with higher weights than others are probably picking up the effects of nearby large-effect QTL and modeling them more accurately than a ridge regression model. The details of Bayesian analysis are quite complicated, so you want to be careful fitting these models unless you have some idea of what you are doing, but the BGLR package at least makes the computations easy for you, and the documentation is excellent (https://github.com/gdlc/BGLR-R and https://www.genetics.org/content/198/2/483).
+
+There are many different prior distributions that can be used (https://doi.org/10.1534/genetics.112.147983), and it pays to think about what is reasonable for your particular situation. Here, we will use the Bayes C pi model. The idea here is that there is a proportion of markers (pi) that will have zero effect on the trait, and the remaining markers will explain the observed variation, and some of those effects can be larger than others. This assumption results in fitting some markers with larger effects (by pushing many markers to zero effect, the remaining markers can 'explain' more variation). This model requires us to specify what the prior distribution of pi is, and of course we don't actually know that, but we can choose priors with low confidence, so that the model explores a wide range of distributions and therefore is not overly influenced by our prior specification.  
+  
+We are going to fit the BayesC model with default prior distribution. 
+    
+probIn is the probability that a marker gets included in the model, default = 0.5
+Counts refers to the confidence in the prior distribution, default =  10, which indicates not very much confidence. Something like 200 would put a lot more weight on the prior distribution, meaning that as the model iterates, it's going to stick closely to the probIn value. 
+  
+You can change the values from the defaults and see what happens. Also, in practice, it's better to run more iterations, try nIter = 20000 and burnIn = 5000. That will take longer, of course.
+```{r}
+bayesc.mod = BGLR(y = dts.blues2$dts.train,
+                  ETA = list(list(X = geno.num2, model = 'BayesC')),
+                  nIter = 5000, 
+                  burnIn = 1000, 
+                  saveAt = 'bc_',
+                  verbose = FALSE)
+```
+
+First let's plot the posterior distribution of squared marker effects:
+```{r}
+bHat<- bayesc.mod$ETA[[1]]$b
+plot(bHat^2, ylab='Estimated Squared-Marker Effect',
+type='o',cex=.5,col=4,main='Marker Effects')
+```
+
+Let's check the markers with largest + effects:
+```{r}
+head(bHat[order(bHat, decreasing = T)])
+```
+```{r}
+head(bHat[order(bHat)])
+```
+There is some indication of a number of markers on chromosome 10 (PZE.10) with larger effects (we know there is a major flowering time gene there).  
+  
+How well did this model predict the test set?
+```{r}
+preds.bayesc = bayesc.mod$yHat
+names(preds.bayesc) = dts.blues2$sampleID
+test.bayesc = preds.bayesc[test]
+test.bayesc = data.frame(sampleID = names(test.bayesc), dts.bayesc = test.bayesc)
+observed.test = merge(observed.test, test.bayesc, by = "sampleID")
+cor(observed.test[c("dts", "dts.bayesc")])
+```
+It's a little bit better than the GBLUP model, and this is a case where we know the genetic architecture is a mix of some large effect variants plus polygenic effects.
+
+##Effect of population structure on genomic predictions
+So far in this example, we have used a random partition of the families into test and training sets. This is fine for getting started and evaluating models and data. But it may not reflect how you want to use genomic prediction in reality. In a real breeding program, we often have historical data on previous generations of a breeding program and want to use that information to predict a future generation. Otherwise, we may have to rely on collecting training phenotypes on our current populations, which we know will be effective but will cost significantly more time.
+
+Let's model a more realistic situation where we use Cycles 0 - 8 as our training set and ask how well that training set predicts the last generation of lines (cycle 10). We are going to re-define train and test vectors to do this.
+```{r}
+train = dts.blues2[dts.blues2$Cycle != "C10", "sampleID"]
+test = dts.blues2[dts.blues2$Cycle == "C10", "sampleID"]
+print("Training set size C0 - C8:")
+print(length(train))
+print("Test set size C10:")
+print(length(test))
+```
+The training set size is still around 80%. But now we are hiding all individuals from C10 from the training set.
+```{r}
+dts.blues2 = dts.blues2 %>%
+  mutate(dts.train = ifelse(sampleID %in% train, dts, NA))
+
+sommer.mod <- mmer(dts.train ~ 1, 
+                   random = ~vs(sampleID, Gu=K),
+                   data = dts.blues2)
+
+#get the GBLUPs and subset to only the test set
+gblups = sommer.mod$U$`u:sampleID`[[1]] #these are deviations from the overall mean (so centered on zero)
+gblups.test = data.frame(sampleID = names(gblups[test]), dts.gblup = gblups[test])
+observed.test = right_join(dts.blues2, gblups.test, by = "sampleID")
+cor(observed.test[c("dts", "dts.gblup")])
+```
+Wow! You can see that we really killed the prediction ability by not included individuals from the last cycle when we predict that last cycle. This is a very important aspect that you need to remember: the training set MUST be representative of the individuals you want to perform selection on!
+```{r}
+mu = sommer.mod$Beta$Estimate
+observed.test$dts.gblup = observed.test$dts.gblup + mu
+plot(observed.test[c("dts.gblup", "dts")])
+```
+```{r}
+print("Mean observed:")
+print(mean(observed.test$dts))
+print("Mean predicted:")
+print(mean(observed.test$dts.gblup))
+```
+And we overestimate the mean a bit more in this case. Remember that the C10 population was about 2 days earlier than C8, our model is not capturing all of that change very well.
+
+

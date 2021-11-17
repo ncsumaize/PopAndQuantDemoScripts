@@ -1,0 +1,390 @@
+---
+title: "Population Structure Analysis"
+author: "Jim Holland"
+date: "8/13/2021"
+output: html_document
+---
+# SNP data
+Data are taken from Wisser et al 2019. Genetics
+https://www.genetics.org/content/213/4/1479  
+  
+34k SNP array markers on ~381 outbred individual plants sampled from different generations of selection for early flowering in a tropical maize population.   
+  
+https://datadryad.org/stash/dataset/doi:10.5061/dryad.q573n5tdt  
+  
+From the read.me:  
+Quality controlled genotype data (45,718 variant sites) for samples from Hallauer's Tusón. Tab delimited file. A header row is included. The first column ("label") lists sample names, the second column ("popdata") lists the generation to which each sample belongs, and the remaining columns correspond to the genotype data. Unphased diploid genotype calls are recorded in the following format: 1/1. Variant encoding: 1=A, 2=C, 3=G, 4=T, 5=deletion, 6=insertion (5 and 6 are used for the ZmCCT10_CACTA locus). Missing genotype calls are encoded as NA.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+path = "Q:/My Drive/Teaching/Teaching_videos"
+geno = read.table(file.path(path, "doi_10.5061_dryad.q573n5tdt__v2", "HT381_QC47518_gtype.txt.gz"), header = T, sep = '\t')
+```
+
+What does this data set look like?
+```{r}
+#str(geno)
+geno[1:3,1:6]
+```
+Notice the first column is a label for the individual, the second column indicates which generation of selection (sub-population) it belongs to.  
+  
+# Data Filtering and Recoding
+
+There are numerous ways to filter and manipulate SNP data sets. bcftools (http://www.htslib.org/doc/1.0/bcftools.html) has numerous functions that can very efficiently filter SNP data sets in the standard variant call format (vcf files, https://github.com/samtools/hts-specs). It works in linux and is good to know if you will be working with SNP data sets.
+
+TASSEL software (https://www.maizegenetics.net/tassel) also is very flexible and has many powerful tools for manipulating and analyzing SNP data in various formats, including vcf and hapmap formats. It has a GUI with point and click menus that make getting started easy. But the drawback is that you may forget what commands you used to manipulate a data set, making your work non-reproducible. Thus, writing analysis scripts is highly recommended, so you can later describe accurately what you did, and also easily modify the methods or use the same approaches on other data sets. One option is rTassel (https://github.com/maize-genetics/rTASSEL), which allows you to write and analyze scripts in R to execute TASSEL analyses.
+
+This example data set is a bit trickier because it's not in a standard VCF or hapmap format. This also happens pretty frequently, so it's also good to have some capability for writing general data handling scripts in R or Python (or whatever language). Here we show some basic ways of manipulating a data set with R. 
+
+Let's do some strong filtering against missing data, dropping lots of markers, mainly because for demonstration I want a smaller marker data set.
+```{r}
+missing = colSums(is.na(geno[,-c(1:2)]))/nrow(geno)
+hist(missing)
+```
+
+```{r}
+keep.columns = missing == 0
+sum(keep.columns)
+geno2 = geno[, c(F, F, keep.columns)]
+dim(geno2)
+```
+
+Numericalize the genotypes to minor allele counts, 0, 1, 2. Here is a hacky DIY way to do it. This will fail if there are more than 3 genotypic classes per locus, so first make a helper function to identify loci with exactly 3 classes, then we will keep only those before numericalizing.
+```{r}
+classes3 = function(x){
+  length(table(x)) == 3
+}
+
+keep.columns2 = apply(geno2, 2, classes3)
+geno3 = geno2[keep.columns2]
+dim(geno3)
+```
+Now create and apply a function to numericalize the genotype calls
+```{r}
+numericalize = function(x){
+  geno.freqs = as.matrix(table(x))
+  labels = row.names(geno.freqs)
+  split.labels = strsplit(labels, "/", fixed = T)
+  which.het = sapply(split.labels, FUN = function(x) x[1] != x[2])
+  het.label = labels[which.het]
+  homoz.freqs = geno.freqs[rownames(geno.freqs) != het.label,]
+  homoz.labels = labels[labels != het.label]
+  minor.label = homoz.labels[which.min(homoz.freqs)]
+  major.label = homoz.labels[homoz.labels != minor.label]
+  translator = c(0, 1, 2)
+  names(translator) = c(major.label, het.label, minor.label)
+  new.x = as.numeric(translator[x])
+}
+```
+
+Try the function on the first two columns
+```{r}
+checkit = apply(geno3[,1:2], 2, FUN = numericalize)
+checkit[1:15,]
+```
+Compare to original data
+```{r}
+as.matrix(geno3[1:15,1:2])
+```
+Now apply the function to all of the columns
+```{r}
+geno.num = apply(geno3[,], 2, FUN = numericalize)
+str(geno.num)
+```
+Note that the column names represent the marker names. We should also re-attach the individual sample IDs as row names of this matrix:
+```{r}
+row.names(geno.num) = geno$label
+```
+
+Compare the genotype frequencies of the original and recoded scores for the 6th SNP (which is a little weird because it has an excess of heterozygotes, it's always good to check these 'edge cases')
+```{r}
+table(geno.num[, 6])
+```
+
+```{r}
+table(geno3[, 6])
+```
+
+One more check is to verify that we have not introduced any NAs during the recoding
+```{r}
+any(is.na(geno.num))
+```
+Notice some nice properties of this numericalized data matrix:  
+1. Since the genotypic scores are now COUNTS of minor alleles in each individual, the minor allele frequencies are just the mean of the counts divided by two.  
+2. The correlations among samples are a measure of the genomic relationships among individuals. With proper scaling, we can estimate the realized additive genetic relationships among the individuals.  
+3. The correlations among markers indicate similarity of information from marker pairs. This can be related to linkage disequilibrium for highly inbred populations or for gametic data, but not directly for outbred populations.  
+We provide examples of each of these properties below:
+
+# Minor allele frequencies
+```{r}
+maf = colMeans(geno.num)/2
+hist(maf)
+```
+  
+This histogram is another good check on recoding our data. The maximum observed minor allele frequency is 0.5. If minor allele frequencies > 0.5 were observed, it would mean that we coded the minor allele incorrectly.  
+  
+We can also compute minor allele frequencies by each generation separately and use that information to find markers that have changed allele frequency over generations:
+```{r}
+generations = geno[,2]
+maf0 = colMeans(geno.num[generations == 0,])/2
+maf10 = colMeans(geno.num[generations == 10,])/2
+maf.dif = maf10 - maf0
+hist(maf0)
+```
+  
+Notice something here, we have no maf > 0.5 in the full data set, but when we split the data set by population and recalculate the minor allele frequencies, some of them are > 0.5. This can happen because the definition of the minor allele depends on the sample. If you change the sample or change the reference population, then which allele is minor can change.  
+  
+Check the histogram of maf after 10 cycles of selection for earlier flowering:
+```{r}
+hist(maf10)
+```
+  
+Here is the histogram of differences in allele frequency between cycle 10 and cycle 0 across SNPs:
+```{r}
+hist(maf.dif)
+```
+
+# Genomic Relationships Among Individuals
+The correlations among individuals represent genomic relationships. Individuals with more similar marker profiles have higher correlation, indicating they share more alleles:
+```{r}
+ind.cor = cor(t(geno.num))
+dim(ind.cor)
+```
+The individuals are sorted by generation, so if allele frequencies changed over generations, we expect to see a little bit of higher relationship within than among generations (a sign of population structure:
+```{r}
+library(RColorBrewer)
+heatmap(ind.cor, Rowv = NA, Colv = NA, symm = T, col = colorRampPalette(brewer.pal(8, "Blues"))(8))
+```
+  
+It's pretty limited, but you can see a little bit of correlation among individuals in the first generation (lower left; the individuals are ordered by generation). There are also some pairs of individuals within that first generation that are more distant than expected, this was a surprise, until we learned that the initial generation was created by open-pollination of several accessions that was not random, so there was assortative mating, and you can see that sub-structure within generation 0 here).  
+  
+The **covariances** among the individuals, scaled by the heterozygosity of the markers is the so-called VanRaden relationship matrix (https://www.sciencedirect.com/science/article/pii/S0022030208709901) and it is scaled to the additive genetic covariances among the individuals. For example, **on average** we expect outbred full-sibs to have additive relationship of 0.5, but individual pairs of full-sibs can vary around that average (I am a little more closely related to some of my brothers than others by chance). To get the scaling right we need to center the markers first. Here we compute the realized additive relationship matrix with matrix algebra, so you can see the calculations involved, but you can also use TASSEL or a package like AGHmatrix to compute the matrix from a SNP data set without having to numericalize it first.
+```{r}
+Z = scale(geno.num, center = T, scale = F)
+ZZpr = Z%*%t(Z)
+denom = 2*sum(maf*(1 - maf))
+K = ZZpr/denom
+#attach the sample IDs as row names
+rownames(K) = geno$label 
+colnames(K) = geno$label
+K[1:5, 1:5]
+```
+
+Some pairs of individuals can have negative additive relationships, indicating that they are LESS related than expected by random chance.  
+  
+Diagonal elements of this matrix estimate 1 + F where F is the genomic inbreeding coefficient for each individual
+```{r}
+F.vals = diag(K) - 1
+hist(F.vals)
+```
+  
+You can see a few individuals look pretty inbred, and a few have negative inbreeding (meaning they are more heterozygous than expected by chance in Hardy-Weinberg equilibrium). Interpretation of these values is a bit tricky if the individuals were not sampled from a common outbreeding population, as we show below. 
+
+We can check how inbreeding has changed over generations:
+```{r}
+df.F = data.frame(generations, F.vals)
+names(df.F)[1] = "Gen"
+df.F %>% group_by(Gen) %>%
+  summarize(MeanF = mean(F.vals))
+```
+Recall that according to breeding records, the individuals were derived from random mating within generations, so we expect something close to HWE (with F = 0) within generations. When you pool data across multiple HWE populations with different allele frequencies, you will observe F > 0 in the meta-population due to differentiation (Fst). As an example, compare what happens when we estimate the relationship matrix ONLY within the initial generation 10 individuals:
+```{r}
+geno10 = geno.num[generations == 10,]
+Z10 = scale(geno10, center = T, scale = F)
+ZZpr10 = Z10%*%t(Z10)
+maf10 = colMeans(geno10)/2
+denom10 = 2*sum(maf10*(1 - maf10))
+K10 = ZZpr10/denom10
+K10[1:5, 1:5]
+```
+```{r}
+mean(diag(K10)) - 1
+```
+Compare this value very close to zero based ONLY on generation 10 individuals to the meta-population mean inbreeding estimate near 0.10 for these same samples.
+
+# Linkage disequilibrium
+Linkage disequilibrium is the non-random association of alleles at different loci. It can occur between unlinked loci, so it's not a good name, but it has stuck, as there tends to be a general relationship of higher LD between more tightly linked loci. In fact, one way that LD can arise is due simply to population structure - because loci that have different allele frequencies in different sub-populations will be in LD when data are combined across the sub-populations.
+
+The linkage disequlibrium correlation for a pair of markers depends on their frequency IN GAMETES (or 'haplotypes'):
+
+$\rho_{AB} = \frac{p_{AB} - p_{A}p_{B}}{\sqrt{p_{A}(1-p_{A})p_{B}(p_{B})}}$
+
+The problem is that $p_{AB}$ is the frequency of the A-B gamete, and we don't know that frequency directly when we have genotypic data. A doubly heterozygous indvidiual has genotype AaBb, but we don't know if it's composed of AB/ab pair of haplotypes or the Ab/aB pair. The simple correlation computed from the numericalized genotype values will be inflated by doubly heterozygous genotypes (a '1-1' type score, which will contribute positively to the correlation).
+
+LD is easy to estimate for highly inbred lines (where each individual carries two copies of the same gamete type) or if you have phased haplotype data, in which case you can just estimate the correlations between numericalized markers. 
+
+But if we have a more general outbred population with extensive heterozygosity, a simple correlation value for LD will always be inflated compared to the true gametic correlation because individuals heterozygous at both loci will both have numerical values of 1 and this will contribute to a positive correlation, whereas in reality we don't actually know if the gametes that created that individual are AB/ab (counting toward a positive correlation between alleles A and B) or Ab/aB (counting toward a negative correlation!).
+
+Unfortunately, we don't have a great solution to this problem for outbred populations. TASSEL software handles this by simply ignoring the heterozygotes (they don't contribute toward the correlation estimate) and computing the correlation only using individuals that are homozygous for both loci. That avoids the bias problem but doesn't use the data efficiently. There are maximum likelihood estimate procedures as alternatives (https://www.nature.com/articles/hdy199655), but they are computationally slow to compute for all marker pairs.
+
+The correlations of the columns are the correlations of the marker numerical scores. Unfortunately, this is NOT interpretable in terms of linkage disequilibrium (LD) when you have heterozygotes. Here, for example, we take the markers from Chromosome 10 (most of which start with PZE.110) and compute their correlations
+```{r}
+chr10.ids = grep("^PZE.110", colnames(geno.num))
+chr10 = geno.num[,chr10.ids[1]:ncol(geno.num)]#get the markers on chr 10 only
+chr10.r = cor(chr10)
+chr10.r2 = chr10.r^2 #get the r-squared values
+heatmap(chr10.r2, Rowv = NA, Colv = NA)
+```
+These markers are ordered by position, you can see the small blocks of correlation around the diagonal indicating more similarity in marker scores for tightly linked pairs.
+
+For comparison, now we set all heterozygotes to missing and then compute the correlation matrix using only pairwise complete observations. The elements of this correlation matrix can be squared to get an estimate of the LD r^2 value that is typically reported.
+```{r}
+chr10.nohets = chr10
+chr10.nohets[chr10.nohets == 1] = NA
+chr10.r.ld = cor(chr10.nohets, use = "pairwise.complete.obs")
+chr10.r2.ld = chr10.r.ld^2 #get the r-squared values
+heatmap(chr10.r2.ld, Rowv = NA, Colv = NA, labRow = NA, labCol = NA)
+```
+This doesn't look too different than the pattern we saw when computing the correlation matrix using the heterozygote values. But you can see that the two methods are at least a bit different in the correlation estimates:
+```{r}
+SNP.sample = colnames(chr10)[1:5]
+chr10.r[SNP.sample, SNP.sample]
+```
+
+
+```{r}
+chr10.r.ld[SNP.sample, SNP.sample]
+```
+Here is the distribution of the differences between the elements of the correlation matrices ignoring hets and including hets:
+```{r}
+summary(c(chr10.r.ld - chr10.r))
+```
+
+Well, that's a surprise. I expected the correlation that ignored the heterozygotes to tend to be less positive than the correlation including the heterozgotes, but actually, it's a little bit more positive. I guess that is happening by chance, since we are dropping lots of values and these particular LD correlation estimates are probably poorly estimated because of the reduced sample size. What do I know?
+
+# Principal Components Analysis of Population Structure
+
+We can visualize population structure using the principal components of the marker data:
+```{r}
+pcs.cov = princomp(t(geno.num), cor = F, scores = T)
+```
+
+The pcs.cov object includes information on the variation associated with each principal component and the PC scores associated with each individual. Here are the standard deviations associated with the first 10 PCs
+```{r}
+pcs.cov$sdev[1:10]
+```
+Let's scale this to the percent of total variation associated with each pc (you can also get this from summary(pcs.cov), but it prints out all the PCs):
+```{r}
+total.var = sum(pcs.cov$sdev^2)
+(pcs.cov$sdev^2)[1:10]/total.var
+```
+So, the first PC explains 20% of the total marker variation. We might reasonably hypothesize that it mostly represents allele frequency changes among generations of selection due to selection and drift. Let's plot the individuals according to their loadings on the first two PCs and include coloring due to generation of selection to see how the PCs correspond to the different selection generations. Create a data frame with the information on generations along with the PCs. This is a surprisingly painful operation since the loadings object within the princomp object can't be directly converted to a data frame. Here's the plan:  
+1. force the loadings object to a numeric matrix - although it looks a lot like a numeric matrix, it isn't :(  
+2. coerce the matrix to a data frame
+```{r}
+PC.df = data.frame(matrix(as.numeric(pcs.cov$loadings), attributes(pcs.cov$loadings)$dim, dimnames=attributes(pcs.cov$loadings)$dimnames))
+PC.df[, c("individual", "Pop")] = geno[,c("label", "popdata"), ]
+PC.df = PC.df %>% mutate(Pop = factor(Pop))
+```
+Plot the individuals colored by Pop on the first two PCs
+```{r}
+ggplot(PC.df, aes(x = Comp.1, y = Comp.2)) + 
+  geom_point(aes(colour= Pop)) +
+  xlab("PC1 (20% of variation)") +
+  ylab("PC2 (3% of variation)")
+```
+  
+A few things are clear from this graph:  
+The variation WITHIN a population is greatest for Cycle 0, see how it is spread most widely in both directions. The variation in Cycle 10 is similar for PC1, but much more compressed for PC2. PC2 really seems to mostly capture variation within Cycle 0 rather than between Cycles.
+You can clearly see the differences between populations, with C10 narrowed for PC2 and pushed negative for PC1 on average compared to C0.  
+These are only two axes and they collectively only explain about 23% of total variation, so there is much additional variation that is probably mostly within populations we are not seeing on this graph.
+
+# Multidimensional scaling - Principal Coordinates 
+MDS/PCoA is a similar idea to PC in that we want to represent the relationships among the individuals in just a few dimensions. MDS works by finding coordinates that best represent the total distance between the individuals in a few dimensions, let's say two dimensions so we can plot them nicely. This is a similar problem to representing the distances between points on earth using a 2-dimensional map. The actual points are in three dimensions on the planet and we cannot represent exactly the distances in two dimensions, but with a good projection we can come close. Here we have the SIMILARITY between individuals measured by their marker covariances and these similarities are in 381 dimensions. We want to convert the similarities to distances and then compress to two dimensions.  
+  
+Euclidean distance(x,y) = $\sqrt{(var(x) + var(y) - 2Cov(x,y))}$  
+  
+We can get this from the marker covariance matrix we already computed above, where the diagonal elements are the marker 'variances' of the individuals and the off-diagonal elements are the covariances.
+
+```{r}
+marker.vars = diag(K) #vector of length 381
+row.vars = marker.vars%*%t(rep(1,381)) #381*1 vector times 1*381 vector of ones = 381*381 matrix  
+str(row.vars)
+```
+row.vars is a matrix with the variance of each individual repeated across the columns for each row:
+```{r}
+row.vars[1:5, 1:5]
+```
+We can transpose this to get a similar matrix with the individual variances repeated down the rows for each column. And if we add the two matrices together we get var(x) + var(y) for each element K(x,y). Then we just need to subtract 2K (= 2*Cov(x,y) for each element) and take the square root of every element to get the distance matrix needed:
+```{r}
+gen.dist = sqrt(row.vars + t(row.vars) - 2*K)
+str(gen.dist)
+```
+The diagonal elements should all be zeroes (distance of individual x with itself is zero):
+```{r}
+gen.dist[1:5,1:5]
+```
+Compare this to the original covariance matrix. The smallest distance observed in genet.dist matrix is between individuals 2 and 5:
+```{r}
+K[1:5,1:5]
+```
+And, in agreement the genetic covariance between individuals 2 and 5 is the greatest in the original matrix.  
+  
+Now we can get the multidimensional scaling coordinates for two dimensions (k = 2)
+```{r}
+mds.coord = cmdscale(gen.dist, eig = T, k=2)
+str(mds.coord)
+```
+The list component "points" is a 381 * 2 matrix that has the coordinates in the first two dimensions for each individual.  
+Add the dimension points to the data frame and plot the individuals in 2-D space, colored by population
+```{r}
+PC.df[,c("mds1", "mds2")] = mds.coord$points
+ggplot(PC.df, aes(x = mds1, y = mds2)) + 
+  geom_point(aes(colour= Pop)) +
+  xlab("Dimension 1") +
+  ylab("Dimension 2")
+```
+  
+Again, you can see the greater diversity of C0 from its wider spread in the plot, and the narrowing and divergence of subsequent cycles. Typically, there is no need to do both PC and MDS plots, pick the method you like and use it.
+
+# Cluster analysis
+Another way to evaluate the potential groupings of the individuals is via cluster analysis. There are lots of methods, k-means and heirarchical (which is really a big group of methods) are common. Let's do k-means clustering and specify that we want to group individuals into 6 clusters, since we know a priori that we have 6 subpopulations. The cluster analysis is based on the original marker data matrix or the covariance matrix (but not the distance matrix)
+```{r}
+set.seed(1)
+kclust = kmeans(K, 6)
+str(kclust)
+```
+Note that this result shows that 505/1172 = 43% of the variation is between clusters, and that most of the variation is WITHIN clusters. So, the clusters are a bit distinct but not very homogeneous (and we should have guessed that from the PC and MDS plots above).
+
+Let's look at the assignment of individuals to cluster numbers (which are arbitrary)
+```{r}
+PC.df$cluster = kclust$cluster
+table(PC.df[,c("Pop", "cluster")])
+```
+You can see that these clusters don't correspond very well to the selection populations. C0 is split among five of the clusters, whereas clusters 1 and 6 have individuals from most populations. In general, cluster analysis is a bit crude, as it is trying to coerce the continuous variation we see in the graphs above into discrete groups.
+
+# Structure analysis
+Structure and fastStructure softwares estimate probabilities that individuals belong to a specific population sub-group. These methods work by first proposing a number of sub-groups, k. Then, given that value, the probabilities that each individual belongs to a particular sub-group is computed, and the inference can also be that the probability value corresponds to the proportion of that individual's genome derived from the sub-group. Unfortunately, the number of sub-groups is not known a priori, so the user must decide what the best number is. Typically, users re-do the analysis for a range of k values, get the likelihood value for each k value (which typically increases for larger values of k), and then pick a value where the change in likelihood slows down. It can be a bit arbitrary. And it's computationally intensive, requiring standalone software. But it makes nice graphic representations of population structure:
+
+![Figure 2 from Wisser et al 2019](Q:/My Drive/Teaching/Teaching_videos/F2.large.jpg)
+
+## Save files for later use
+Let's save the numericalized and filtered genotypic data set for later use, and also the genomic relationship matrix, which is useful for both association mapping and genomic prediction analyses.
+
+#save files as comma separated flat text files
+```{r}
+write.csv(geno.num, file = "Q:/My Drive/Teaching/Teaching_videos/Tuson_geno_num.csv",
+row.names = T, quote = F)
+
+write.csv(K,file = "Q:/My Drive/Teaching/Teaching_videos/Tuson_Kmat.csv",
+row.names = T, quote = F )
+```
+
+read back in with:
+  
+geno.num2 = as.matrix(read.csv("Q:/My Drive/Teaching/Teaching_videos/Tuson_geno_num.csv", header = T, row.names = 1))
+K2 = as.matrix(read.csv("Q:/My Drive/Teaching/Teaching_videos/Tuson_geno_num.csv", header = T, row.names = 1))
+  
+save both objects into a single Rdata file
+```{r}
+save(geno.num, K, file = "Q:/My Drive/Teaching/Teaching_videos/Tuson.Rdata")
+```
+which can be opened in another R session using:
+  
+load("Q:/My Drive/Teaching/Teaching_videos/Tuson.Rdata")
+
+
